@@ -3,7 +3,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics.functional import retrieval_average_precision
-import pytorch_lightning as pl
+
+try:
+    import lightning.pytorch as pl
+except ImportError:
+    import pytorch_lightning as pl
 
 from src.clip import clip
 from experiments.options import opts
@@ -35,6 +39,9 @@ class Model(pl.LightningModule):
             distance_function=self.distance_fn, margin=0.2)
 
         self.best_metric = -1e3
+        self.latest_train_loss = None
+        self.train_step_losses = []
+        self.validation_step_outputs = []
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam([
@@ -58,8 +65,17 @@ class Model(pl.LightningModule):
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        self.log('train_loss', loss)
+        self.train_step_losses.append(loss.detach())
         return loss
+
+    def on_train_epoch_end(self):
+        if len(self.train_step_losses) == 0:
+            return
+
+        train_loss = torch.stack(self.train_step_losses).mean()
+        self.latest_train_loss = train_loss.item()
+        self.log('train_loss', train_loss, prog_bar=False, logger=True)
+        self.train_step_losses.clear()
 
     def validation_step(self, batch, batch_idx):
         sk_tensor, img_tensor, neg_tensor, category = batch[:4]
@@ -68,16 +84,27 @@ class Model(pl.LightningModule):
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        self.log('val_loss', loss)
-        return sk_feat, img_feat, category
+        self.validation_step_outputs.append({
+            'val_loss': loss.detach(),
+            'sk_feat': sk_feat.detach(),
+            'img_feat': img_feat.detach(),
+            'category': category,
+        })
+        return loss
 
-    def validation_epoch_end(self, val_step_outputs):
-        Len = len(val_step_outputs)
+    def on_validation_epoch_end(self):
+        if self.trainer is not None and getattr(self.trainer, 'sanity_checking', False):
+            self.validation_step_outputs.clear()
+            return
+
+        Len = len(self.validation_step_outputs)
         if Len == 0:
             return
-        query_feat_all = torch.cat([val_step_outputs[i][0] for i in range(Len)])
-        gallery_feat_all = torch.cat([val_step_outputs[i][1] for i in range(Len)])
-        all_category = np.array(sum([list(val_step_outputs[i][2]) for i in range(Len)], []))
+
+        val_loss = torch.stack([self.validation_step_outputs[i]['val_loss'] for i in range(Len)]).mean()
+        query_feat_all = torch.cat([self.validation_step_outputs[i]['sk_feat'] for i in range(Len)])
+        gallery_feat_all = torch.cat([self.validation_step_outputs[i]['img_feat'] for i in range(Len)])
+        all_category = np.array(sum([list(self.validation_step_outputs[i]['category']) for i in range(Len)], []))
 
 
         ## mAP category-level SBIR Metrics
@@ -89,9 +116,25 @@ class Model(pl.LightningModule):
             target = torch.zeros(len(gallery), dtype=torch.bool)
             target[np.where(all_category == category)] = True
             ap[idx] = retrieval_average_precision(distance.cpu(), target.cpu())
-        
+
         mAP = torch.mean(ap)
-        self.log('mAP', mAP)
+        self.log('val_loss', val_loss, prog_bar=False, logger=True)
+        self.log('mAP', mAP, prog_bar=False, logger=True)
+
         if self.global_step > 0:
-            self.best_metric = self.best_metric if  (self.best_metric > mAP.item()) else mAP.item()
-        print ('mAP: {}, Best mAP: {}'.format(mAP.item(), self.best_metric))
+            self.best_metric = max(self.best_metric, mAP.item())
+
+        epoch_summary = ['Epoch {}'.format(self.current_epoch + 1)]
+        if self.latest_train_loss is not None:
+            epoch_summary.append('train_loss: {:.4f}'.format(self.latest_train_loss))
+        epoch_summary.append('val_loss: {:.4f}'.format(val_loss.item()))
+        epoch_summary.append('mAP: {:.4f}'.format(mAP.item()))
+        epoch_summary.append('best_mAP: {:.4f}'.format(self.best_metric))
+        print(' | '.join(epoch_summary))
+        self.validation_step_outputs.clear()
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint['best_metric'] = self.best_metric
+
+    def on_load_checkpoint(self, checkpoint):
+        self.best_metric = checkpoint.get('best_metric', self.best_metric)

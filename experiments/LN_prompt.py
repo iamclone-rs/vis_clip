@@ -1,10 +1,16 @@
 import os
-import glob
+import inspect
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from pytorch_lightning import Trainer
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
+
+try:
+    from lightning.pytorch import Trainer
+    from lightning.pytorch.loggers import TensorBoardLogger
+    from lightning.pytorch.callbacks import ModelCheckpoint
+except ImportError:
+    from pytorch_lightning import Trainer
+    from pytorch_lightning.loggers import TensorBoardLogger
+    from pytorch_lightning.callbacks import ModelCheckpoint
 
 from src.model_LN_prompt import Model
 from src.dataset_retrieval import Sketchy
@@ -21,35 +27,58 @@ if __name__ == '__main__':
 
     logger = TensorBoardLogger('tb_logs', name=opts.exp_name)
 
-    checkpoint_callback = ModelCheckpoint(
-        monitor='val_loss',
-        dirpath='saved_models/%s'%opts.exp_name,
-        filename="{epoch:02d}-{top10:.2f}",
-        mode='min',
-        save_last=True)
+    checkpoint_dir = os.path.join('saved_models', opts.exp_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-    ckpt_path = os.path.join('saved_models', opts.exp_name, 'last.ckpt')
+    checkpoint_kwargs = {
+        'monitor': 'mAP',
+        'dirpath': checkpoint_dir,
+        'filename': 'best',
+        'mode': 'max',
+        'save_top_k': 1,
+        'save_last': True,
+    }
+    checkpoint_signature = inspect.signature(ModelCheckpoint.__init__).parameters
+    if 'auto_insert_metric_name' in checkpoint_signature:
+        checkpoint_kwargs['auto_insert_metric_name'] = False
+    if 'enable_version_counter' in checkpoint_signature:
+        checkpoint_kwargs['enable_version_counter'] = False
+    checkpoint_callback = ModelCheckpoint(**checkpoint_kwargs)
+
+    ckpt_path = os.path.join(checkpoint_dir, 'last.ckpt')
     if not os.path.exists(ckpt_path):
         ckpt_path = None
     else:
         print ('resuming training from %s'%ckpt_path)
 
-    trainer = Trainer(gpus=-1,
-        min_epochs=1, max_epochs=2000,
+    trainer_kwargs = dict(
+        min_epochs=1,
+        max_epochs=2000,
         benchmark=True,
         logger=logger,
-        # val_check_interval=10, 
-        # accumulate_grad_batches=1,
-        check_val_every_n_epoch=5,
-        resume_from_checkpoint=ckpt_path,
+        check_val_every_n_epoch=1,
         callbacks=[checkpoint_callback]
     )
+    trainer_signature = inspect.signature(Trainer.__init__).parameters
+    if 'devices' in trainer_signature:
+        trainer_kwargs['accelerator'] = 'auto'
+        trainer_kwargs['devices'] = 'auto'
+    elif 'gpus' in trainer_signature:
+        trainer_kwargs['gpus'] = -1
+    if 'resume_from_checkpoint' in trainer_signature and ckpt_path is not None:
+        trainer_kwargs['resume_from_checkpoint'] = ckpt_path
+    if 'enable_progress_bar' in trainer_signature:
+        trainer_kwargs['enable_progress_bar'] = False
+    elif 'progress_bar_refresh_rate' in trainer_signature:
+        trainer_kwargs['progress_bar_refresh_rate'] = 0
 
-    if ckpt_path is None:
-        model = Model()
-    else:
-        print ('resuming training from %s'%ckpt_path)
-        model = Model().load_from_checkpoint(ckpt_path)
+    trainer = Trainer(**trainer_kwargs)
+
+    model = Model()
 
     print ('beginning training...good luck...')
-    trainer.fit(model, train_loader, val_loader)
+    fit_kwargs = {}
+    fit_signature = inspect.signature(trainer.fit).parameters
+    if 'ckpt_path' in fit_signature and ckpt_path is not None:
+        fit_kwargs['ckpt_path'] = ckpt_path
+    trainer.fit(model, train_loader, val_loader, **fit_kwargs)
