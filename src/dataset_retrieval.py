@@ -29,26 +29,6 @@ unseen_classes = [
     "window",
 ]
 
-
-def resolve_categories(opts, mode='train', used_cat=None):
-    categories = os.listdir(os.path.join(opts.data_dir, 'sketch'))
-    if '.ipynb_checkpoints' in categories:
-        categories.remove('.ipynb_checkpoints')
-
-    if opts.data_split > 0:
-        np.random.shuffle(categories)
-        if used_cat is None:
-            categories = categories[:int(len(categories) * opts.data_split)]
-        else:
-            categories = list(set(categories) - set(used_cat))
-    else:
-        if mode == 'train':
-            categories = list(set(categories) - set(unseen_classes))
-        else:
-            categories = [category for category in unseen_classes if category in categories]
-
-    return categories
-
 class Sketchy(torch.utils.data.Dataset):
 
     def __init__(self, opts, transform, mode='train', used_cat=None, return_orig=False):
@@ -57,7 +37,21 @@ class Sketchy(torch.utils.data.Dataset):
         self.transform = transform
         self.return_orig = return_orig
 
-        self.all_categories = resolve_categories(self.opts, mode=mode, used_cat=used_cat)
+        self.all_categories = os.listdir(os.path.join(self.opts.data_dir, 'sketch'))
+        if '.ipynb_checkpoints' in self.all_categories:
+            self.all_categories.remove('.ipynb_checkpoints')
+            
+        if self.opts.data_split > 0:
+            np.random.shuffle(self.all_categories)
+            if used_cat is None:
+                self.all_categories = self.all_categories[:int(len(self.all_categories)*self.opts.data_split)]
+            else:
+                self.all_categories = list(set(self.all_categories) - set(used_cat))
+        else:
+            if mode == 'train':
+                self.all_categories = list(set(self.all_categories) - set(unseen_classes))
+            else:
+                self.all_categories = unseen_classes
 
         self.all_sketches_path = []
         self.all_photos_path = {}
@@ -103,43 +97,6 @@ class Sketchy(torch.utils.data.Dataset):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         return dataset_transforms
-
-
-class SketchyEval(torch.utils.data.Dataset):
-
-    def __init__(self, opts, transform, mode='val', domain='sketch', used_cat=None):
-        self.opts = opts
-        self.transform = transform
-        self.domain = domain
-        self.all_categories = resolve_categories(self.opts, mode=mode, used_cat=used_cat)
-        self.samples = []
-
-        if self.domain == 'sketch':
-            extension = '*.png'
-        elif self.domain == 'photo':
-            extension = '*.jpg'
-        else:
-            raise ValueError('domain must be either sketch or photo')
-
-        for category in self.all_categories:
-            self.samples.extend([
-                (filepath, category) for filepath in glob.glob(
-                    os.path.join(self.opts.data_dir, self.domain, category, extension)
-                )
-            ])
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, index):
-        filepath, category = self.samples[index]
-        filename = os.path.basename(filepath)
-        data = ImageOps.pad(
-            Image.open(filepath).convert('RGB'),
-            size=(self.opts.max_size, self.opts.max_size)
-        )
-        tensor = self.transform(data)
-        return tensor, category, filename
 
 
 if __name__ == '__main__':
