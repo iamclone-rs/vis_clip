@@ -1,11 +1,11 @@
 import argparse
 import csv
+import inspect
 import json
 import math
 import os
 import random
 import sys
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,12 +16,9 @@ from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-try:
-    import matplotlib.pyplot as plt
-except ModuleNotFoundError as exc:
-    raise ModuleNotFoundError(
-        "matplotlib is required for visualization. Install it with `pip install matplotlib`."
-    ) from exc
+
+import matplotlib.pyplot as plt
+
 
 try:
     from sklearn.manifold import TSNE
@@ -214,8 +211,8 @@ def parse_args():
         "--projection",
         type=str,
         default="tsne",
-        choices=["tsne", "pca"],
-        help="2D projection method.",
+        choices=["tsne"],
+        help="2D projection method. Only sklearn TSNE is supported.",
     )
     parser.add_argument("--tsne_perplexity", type=float, default=30.0)
     parser.add_argument("--tsne_n_iter", type=int, default=1500)
@@ -418,46 +415,37 @@ def compute_frechet_report(photo_features, photo_metadata, sketch_features, sket
     return report
 
 
-def compute_pca_projection(features):
-    centered = features - features.mean(dim=0, keepdim=True)
-    if torch.allclose(centered.abs().sum(), torch.tensor(0.0)):
-        return torch.zeros((features.shape[0], 2), dtype=torch.float32), {"method": "pca"}
-
-    q = min(8, centered.shape[0], centered.shape[1])
-    q = max(2, q)
-    _, _, right_vectors = torch.pca_lowrank(centered, q=q)
-    coords = centered @ right_vectors[:, :2]
-    if coords.shape[1] == 1:
-        coords = torch.cat([coords, torch.zeros((coords.shape[0], 1))], dim=1)
-    return coords[:, :2].float(), {"method": "pca"}
-
-
 def compute_projection(features, args):
-    if args.projection == "tsne":
-        if TSNE is None:
-            warnings.warn("scikit-learn is not installed. Falling back to PCA.")
-            return compute_pca_projection(features)
+    if TSNE is None:
+        raise ImportError(
+            "scikit-learn is required to run t-SNE. Install `scikit-learn` and rerun."
+        )
 
-        sample_count = features.shape[0]
-        if sample_count <= 2:
-            return compute_pca_projection(features)
+    sample_count = features.shape[0]
+    if sample_count < 2:
+        raise ValueError(
+            f"sklearn TSNE needs at least 2 samples, but got {sample_count}."
+        )
 
-        perplexity = max(1.0, min(args.tsne_perplexity, float(sample_count - 1)))
-        coords = TSNE(
-            n_components=2,
-            perplexity=perplexity,
-            init="pca",
-            learning_rate="auto",
-            n_iter=args.tsne_n_iter,
-            random_state=args.seed,
-        ).fit_transform(features.numpy())
-        return torch.from_numpy(coords).float(), {
-            "method": "tsne",
-            "perplexity": perplexity,
-            "n_iter": args.tsne_n_iter,
-        }
+    perplexity = max(1.0, min(args.tsne_perplexity, float(sample_count - 1)))
+    tsne_kwargs = {
+        "n_components": 2,
+        "perplexity": perplexity,
+        "init": "random",
+        "learning_rate": "auto",
+        "random_state": args.seed,
+    }
+    tsne_signature = inspect.signature(TSNE.__init__)
+    iter_parameter = "max_iter" if "max_iter" in tsne_signature.parameters else "n_iter"
+    tsne_kwargs[iter_parameter] = args.tsne_n_iter
 
-    return compute_pca_projection(features)
+    coords = TSNE(**tsne_kwargs).fit_transform(features.cpu().numpy())
+    return torch.from_numpy(coords).float(), {
+        "method": "tsne",
+        "perplexity": perplexity,
+        "n_iter": args.tsne_n_iter,
+        "init": "random",
+    }
 
 
 def normalize_coords(coords):
