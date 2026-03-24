@@ -1,14 +1,35 @@
 import os
-import glob
 from torch.utils.data import DataLoader
-from torchvision import transforms
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import Callback
 
 from src.model_LN_prompt import Model
 from src.dataset_retrieval import Sketchy
 from experiments.options import opts
+
+
+class SaveBestAndLastCheckpoint(Callback):
+    def __init__(self, dirpath, monitor='mAP'):
+        super().__init__()
+        self.dirpath = dirpath
+        self.monitor = monitor
+        self.best_path = os.path.join(dirpath, 'best.ckpt')
+        self.last_path = os.path.join(dirpath, 'last.ckpt')
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+
+        os.makedirs(self.dirpath, exist_ok=True)
+
+        current_score = trainer.callback_metrics.get(self.monitor)
+        if current_score is not None:
+            current_score = current_score.item()
+            if current_score >= pl_module.best_metric.item():
+                trainer.save_checkpoint(self.best_path)
+
+        trainer.save_checkpoint(self.last_path)
 
 if __name__ == '__main__':
     dataset_transforms = Sketchy.data_transform(opts)
@@ -20,15 +41,11 @@ if __name__ == '__main__':
     val_loader = DataLoader(dataset=val_dataset, batch_size=opts.batch_size, num_workers=opts.workers)
 
     logger = TensorBoardLogger('tb_logs', name=opts.exp_name)
+    checkpoint_dir = os.path.join('saved_models', opts.exp_name)
 
-    checkpoint_callback = ModelCheckpoint(
-        monitor='val_loss',
-        dirpath='saved_models/%s'%opts.exp_name,
-        filename="{epoch:02d}-{top10:.2f}",
-        mode='min',
-        save_last=True)
+    checkpoint_callback = SaveBestAndLastCheckpoint(checkpoint_dir)
 
-    ckpt_path = os.path.join('saved_models', opts.exp_name, 'last.ckpt')
+    ckpt_path = os.path.join(checkpoint_dir, 'last.ckpt')
     if not os.path.exists(ckpt_path):
         ckpt_path = None
     else:
@@ -38,18 +55,12 @@ if __name__ == '__main__':
         min_epochs=1, max_epochs=2000,
         benchmark=True,
         logger=logger,
-        # val_check_interval=10, 
-        # accumulate_grad_batches=1,
-        check_val_every_n_epoch=5,
-        resume_from_checkpoint=ckpt_path,
+        enable_progress_bar=False,
+        check_val_every_n_epoch=1,
         callbacks=[checkpoint_callback]
     )
 
-    if ckpt_path is None:
-        model = Model()
-    else:
-        print ('resuming training from %s'%ckpt_path)
-        model = Model().load_from_checkpoint(ckpt_path)
+    model = Model()
 
     print ('beginning training...good luck...')
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)

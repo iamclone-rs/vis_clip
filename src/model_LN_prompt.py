@@ -34,7 +34,8 @@ class Model(pl.LightningModule):
         self.loss_fn = nn.TripletMarginWithDistanceLoss(
             distance_function=self.distance_fn, margin=0.2)
 
-        self.best_metric = -1e3
+        self.register_buffer('best_metric', torch.tensor(float('-inf')))
+        self.train_epoch_loss = None
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam([
@@ -58,8 +59,15 @@ class Model(pl.LightningModule):
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        self.log('train_loss', loss)
-        return loss
+        return {'loss': loss}
+
+    def training_epoch_end(self, outputs):
+        if len(outputs) == 0:
+            return
+
+        train_loss = torch.stack([output['loss'].detach() for output in outputs]).mean()
+        self.train_epoch_loss = train_loss.item()
+        self.log('train_loss', train_loss, prog_bar=False, logger=True)
 
     def validation_step(self, batch, batch_idx):
         sk_tensor, img_tensor, neg_tensor, category = batch[:4]
@@ -68,16 +76,25 @@ class Model(pl.LightningModule):
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        self.log('val_loss', loss)
-        return sk_feat, img_feat, category
+        return {
+            'loss': loss.detach(),
+            'sk_feat': sk_feat.detach(),
+            'img_feat': img_feat.detach(),
+            'category': category,
+        }
 
     def validation_epoch_end(self, val_step_outputs):
+        if self.trainer.sanity_checking:
+            return
+
         Len = len(val_step_outputs)
         if Len == 0:
             return
-        query_feat_all = torch.cat([val_step_outputs[i][0] for i in range(Len)])
-        gallery_feat_all = torch.cat([val_step_outputs[i][1] for i in range(Len)])
-        all_category = np.array(sum([list(val_step_outputs[i][2]) for i in range(Len)], []))
+
+        val_loss = torch.stack([val_step_outputs[i]['loss'] for i in range(Len)]).mean()
+        query_feat_all = torch.cat([val_step_outputs[i]['sk_feat'] for i in range(Len)])
+        gallery_feat_all = torch.cat([val_step_outputs[i]['img_feat'] for i in range(Len)])
+        all_category = np.array(sum([list(val_step_outputs[i]['category']) for i in range(Len)], []))
 
 
         ## mAP category-level SBIR Metrics
@@ -91,7 +108,15 @@ class Model(pl.LightningModule):
             ap[idx] = retrieval_average_precision(distance.cpu(), target.cpu())
         
         mAP = torch.mean(ap)
+        self.log('val_loss', val_loss, prog_bar=False, logger=True)
         self.log('mAP', mAP)
-        if self.global_step > 0:
-            self.best_metric = self.best_metric if  (self.best_metric > mAP.item()) else mAP.item()
-        print ('mAP: {}, Best mAP: {}'.format(mAP.item(), self.best_metric))
+        self.best_metric.copy_(torch.maximum(self.best_metric, mAP.detach().to(self.best_metric.device)))
+
+        train_loss_str = 'n/a' if self.train_epoch_loss is None else f'{self.train_epoch_loss:.4f}'
+        self.print(
+            f'Epoch {self.current_epoch + 1}: '
+            f'train_loss={train_loss_str} '
+            f'val_loss={val_loss.item():.4f} '
+            f'mAP={mAP.item():.4f} '
+            f'best_mAP={self.best_metric.item():.4f}'
+        )

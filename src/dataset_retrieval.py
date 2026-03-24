@@ -101,14 +101,13 @@ class Sketchy(torch.utils.data.Dataset):
 
 if __name__ == '__main__':
     from experiments.options import opts
-    import tqdm
 
     dataset_transforms = Sketchy.data_transform(opts)
     dataset_train = Sketchy(opts, dataset_transforms, mode='train', return_orig=True)
     dataset_val = Sketchy(opts, dataset_transforms, mode='val', used_cat=dataset_train.all_categories, return_orig=True)
 
     idx = 0
-    for data in tqdm.tqdm(dataset_val):
+    for data in dataset_val:
         continue
         (sk_tensor, img_tensor, neg_tensor, filename,
             sk_data, img_data, neg_data) = data
