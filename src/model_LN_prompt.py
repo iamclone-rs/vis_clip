@@ -1,8 +1,7 @@
-import numpy as np
+import hashlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchmetrics.functional import retrieval_average_precision
 import pytorch_lightning as pl
 
 from src.clip import clip
@@ -17,6 +16,22 @@ def freeze_all_but_bn(m):
             m.weight.requires_grad_(False)
         if hasattr(m, 'bias') and m.bias is not None:
             m.bias.requires_grad_(False)
+
+
+def category_to_id(category):
+    return int(hashlib.sha1(category.encode('utf-8')).hexdigest()[:16], 16)
+
+
+def average_precision(scores, target):
+    target = target.bool()
+    num_pos = int(target.sum().item())
+    if num_pos == 0:
+        raise RuntimeError('Found a query with no positive gallery items while computing mAP.')
+
+    ranked_target = target[torch.argsort(scores, descending=True)].float()
+    ranks = torch.arange(1, ranked_target.numel() + 1, device=scores.device, dtype=scores.dtype)
+    precision_at_k = torch.cumsum(ranked_target, dim=0) / ranks
+    return (precision_at_k * ranked_target).sum() / num_pos
 
 class Model(pl.LightningModule):
     def __init__(self):
@@ -35,13 +50,18 @@ class Model(pl.LightningModule):
             distance_function=self.distance_fn, margin=0.2)
 
         self.register_buffer('best_metric', torch.tensor(float('-inf')))
-        self.train_epoch_loss = None
+        self.train_loss_sum = None
+        self.train_loss_count = None
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam([
             {'params': self.clip.parameters(), 'lr': self.opts.clip_LN_lr},
             {'params': [self.sk_prompt] + [self.img_prompt], 'lr': self.opts.prompt_lr}])
         return optimizer
+
+    def on_train_epoch_start(self):
+        self.train_loss_sum = torch.tensor(0.0, device=self.device)
+        self.train_loss_count = torch.tensor(0.0, device=self.device)
 
     def forward(self, data, dtype='image'):
         if dtype == 'image':
@@ -59,15 +79,12 @@ class Model(pl.LightningModule):
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        return {'loss': loss}
-
-    def training_epoch_end(self, outputs):
-        if len(outputs) == 0:
-            return
-
-        train_loss = torch.stack([output['loss'].detach() for output in outputs]).mean()
-        self.train_epoch_loss = train_loss.item()
-        self.log('train_loss', train_loss, prog_bar=False, logger=True)
+        batch_size = sk_tensor.shape[0]
+        self.train_loss_sum += loss.detach() * batch_size
+        self.train_loss_count += batch_size
+        self.log('train_loss', loss.detach(), on_step=False, on_epoch=True,
+            prog_bar=False, logger=True, sync_dist=True, batch_size=batch_size)
+        return loss
 
     def validation_step(self, batch, batch_idx):
         sk_tensor, img_tensor, neg_tensor, category = batch[:4]
@@ -76,11 +93,18 @@ class Model(pl.LightningModule):
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
+        batch_size = sk_tensor.shape[0]
+        if isinstance(category, str):
+            category = [category]
         return {
-            'loss': loss.detach(),
+            'loss_sum': loss.detach() * batch_size,
+            'count': torch.tensor(float(batch_size), device=loss.device),
             'sk_feat': sk_feat.detach(),
             'img_feat': img_feat.detach(),
-            'category': category,
+            'category_id': torch.tensor(
+                [category_to_id(cat) for cat in category],
+                device=loss.device,
+                dtype=torch.long),
         }
 
     def validation_epoch_end(self, val_step_outputs):
@@ -91,32 +115,45 @@ class Model(pl.LightningModule):
         if Len == 0:
             return
 
-        val_loss = torch.stack([val_step_outputs[i]['loss'] for i in range(Len)]).mean()
+        val_loss_sum = torch.stack([val_step_outputs[i]['loss_sum'] for i in range(Len)]).sum()
+        val_loss_count = torch.stack([val_step_outputs[i]['count'] for i in range(Len)]).sum()
         query_feat_all = torch.cat([val_step_outputs[i]['sk_feat'] for i in range(Len)])
         gallery_feat_all = torch.cat([val_step_outputs[i]['img_feat'] for i in range(Len)])
-        all_category = np.array(sum([list(val_step_outputs[i]['category']) for i in range(Len)], []))
+        all_category = torch.cat([val_step_outputs[i]['category_id'] for i in range(Len)])
+
+        if self.trainer.world_size > 1:
+            query_feat_all = self.all_gather(query_feat_all).reshape(-1, query_feat_all.shape[-1])
+            gallery_feat_all = self.all_gather(gallery_feat_all).reshape(-1, gallery_feat_all.shape[-1])
+            all_category = self.all_gather(all_category).reshape(-1)
+            val_loss_sum = self.all_gather(val_loss_sum).sum()
+            val_loss_count = self.all_gather(val_loss_count).sum()
+            train_loss_sum = self.all_gather(self.train_loss_sum).sum()
+            train_loss_count = self.all_gather(self.train_loss_count).sum()
+        else:
+            train_loss_sum = self.train_loss_sum
+            train_loss_count = self.train_loss_count
+
+        val_loss = val_loss_sum / val_loss_count.clamp_min(1.0)
+        train_loss = train_loss_sum / train_loss_count.clamp_min(1.0)
 
 
         ## mAP category-level SBIR Metrics
         gallery = gallery_feat_all
-        ap = torch.zeros(len(query_feat_all))
+        ap = torch.zeros(len(query_feat_all), device=gallery.device)
         for idx, sk_feat in enumerate(query_feat_all):
             category = all_category[idx]
-            distance = -1*self.distance_fn(sk_feat.unsqueeze(0), gallery)
-            target = torch.zeros(len(gallery), dtype=torch.bool)
-            target[np.where(all_category == category)] = True
-            ap[idx] = retrieval_average_precision(distance.cpu(), target.cpu())
+            scores = F.cosine_similarity(sk_feat.unsqueeze(0), gallery, dim=1)
+            target = all_category == category
+            ap[idx] = average_precision(scores, target)
         
         mAP = torch.mean(ap)
         self.log('val_loss', val_loss, prog_bar=False, logger=True)
         self.log('mAP', mAP)
         self.best_metric.copy_(torch.maximum(self.best_metric, mAP.detach().to(self.best_metric.device)))
-
-        train_loss_str = 'n/a' if self.train_epoch_loss is None else f'{self.train_epoch_loss:.4f}'
         self.print(
             f'Epoch {self.current_epoch + 1}: '
-            f'train_loss={train_loss_str} '
+            f'train_loss={train_loss.item():.4f} '
             f'val_loss={val_loss.item():.4f} '
-            f'mAP={mAP.item():.4f} '
-            f'best_mAP={self.best_metric.item():.4f}'
+            f'mAP={mAP.item():.6f} '
+            f'best_mAP={self.best_metric.item():.6f}'
         )
