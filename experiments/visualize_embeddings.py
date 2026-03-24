@@ -23,15 +23,8 @@ from src.dataset_retrieval import Sketchy
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-def sample_paths(paths, limit):
-    if limit <= 0 or len(paths) <= limit:
-        return paths
-    indices = np.linspace(0, len(paths) - 1, num=limit, dtype=int)
-    return [paths[index] for index in indices]
-
-
 class FolderDataset(Dataset):
-    def __init__(self, root, classnames, max_size, max_samples_per_class):
+    def __init__(self, root, classnames, max_size):
         self.max_size = max_size
         self.transform = Sketchy.data_transform(SimpleNamespace(max_size=max_size))
         self.samples = []
@@ -45,7 +38,7 @@ class FolderDataset(Dataset):
             )
             self.samples.extend(
                 (path, label, classname)
-                for path in sample_paths(paths, max_samples_per_class)
+                for path in paths
             )
 
     def __len__(self):
@@ -68,7 +61,6 @@ def parse_args():
     parser.add_argument("--max_size", type=int, default=224)
     parser.add_argument("--test_batch_size", type=int, default=256)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--max_samples_per_class", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -135,8 +127,8 @@ def main():
     photo_root = Path(args.data_dir) / "photo"
     sketch_root = Path(args.data_dir) / "sketch"
 
-    photo_dataset = FolderDataset(photo_root, args.classes, args.max_size, args.max_samples_per_class)
-    sketch_dataset = FolderDataset(sketch_root, args.classes, args.max_size, args.max_samples_per_class)
+    photo_dataset = FolderDataset(photo_root, args.classes, args.max_size)
+    sketch_dataset = FolderDataset(sketch_root, args.classes, args.max_size)
 
     dataloader_kwargs = {
         "batch_size": args.test_batch_size,
