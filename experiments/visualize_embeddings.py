@@ -348,6 +348,76 @@ def extract_embeddings(model, dataloader, domain, device, normalize_features):
     return torch.cat(features, dim=0), metadata
 
 
+def compute_feature_stats(features):
+    features = features.double()
+    mean = features.mean(dim=0)
+    if features.shape[0] < 2:
+        covariance = torch.zeros(
+            (features.shape[1], features.shape[1]),
+            dtype=features.dtype,
+        )
+    else:
+        centered = features - mean
+        covariance = centered.t().mm(centered) / (features.shape[0] - 1)
+    covariance = 0.5 * (covariance + covariance.t())
+    return mean, covariance
+
+
+def matrix_sqrt_psd(matrix):
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+    clipped = torch.clamp(eigenvalues, min=0.0)
+    sqrt_diag = torch.sqrt(clipped)
+    return (eigenvectors * sqrt_diag.unsqueeze(0)) @ eigenvectors.t()
+
+
+def compute_frechet_distance(features_a, features_b, eps=1e-6):
+    mean_a, cov_a = compute_feature_stats(features_a)
+    mean_b, cov_b = compute_feature_stats(features_b)
+
+    eye = torch.eye(cov_a.shape[0], dtype=cov_a.dtype)
+    cov_a = cov_a + eye * eps
+    cov_b = cov_b + eye * eps
+
+    sqrt_cov_a = matrix_sqrt_psd(cov_a)
+    middle = sqrt_cov_a @ cov_b @ sqrt_cov_a
+    middle = 0.5 * (middle + middle.t())
+    sqrt_product = matrix_sqrt_psd(middle)
+
+    diff = mean_a - mean_b
+    distance = diff.dot(diff) + torch.trace(cov_a) + torch.trace(cov_b) - 2.0 * torch.trace(sqrt_product)
+    return float(torch.clamp(distance, min=0.0).item())
+
+
+def compute_frechet_report(photo_features, photo_metadata, sketch_features, sketch_metadata, classnames):
+    report = {
+        "overall": compute_frechet_distance(photo_features, sketch_features),
+        "per_class": {},
+    }
+
+    for classname in classnames:
+        photo_mask = torch.tensor(
+            [item["class_name"] == classname for item in photo_metadata],
+            dtype=torch.bool,
+        )
+        sketch_mask = torch.tensor(
+            [item["class_name"] == classname for item in sketch_metadata],
+            dtype=torch.bool,
+        )
+        if not photo_mask.any() or not sketch_mask.any():
+            continue
+
+        report["per_class"][classname] = {
+            "photo_count": int(photo_mask.sum().item()),
+            "sketch_count": int(sketch_mask.sum().item()),
+            "distance": compute_frechet_distance(
+                photo_features[photo_mask],
+                sketch_features[sketch_mask],
+            ),
+        }
+
+    return report
+
+
 def compute_pca_projection(features):
     centered = features - features.mean(dim=0, keepdim=True)
     if torch.allclose(centered.abs().sum(), torch.tensor(0.0)):
@@ -602,6 +672,13 @@ def main():
         device=device,
         normalize_features=args.normalize_features,
     )
+    frechet_report = compute_frechet_report(
+        photo_features=photo_features,
+        photo_metadata=photo_metadata,
+        sketch_features=sketch_features,
+        sketch_metadata=sketch_metadata,
+        classnames=args.classes,
+    )
 
     all_features = torch.cat([photo_features, sketch_features], dim=0).float()
     all_metadata = photo_metadata + sketch_metadata
@@ -645,6 +722,7 @@ def main():
         "projection": projection_info,
         "layout": args.layout,
         "normalize_features": args.normalize_features,
+        "frechet_distance": frechet_report,
         "num_photo_samples": len(photo_dataset),
         "num_sketch_samples": len(sketch_dataset),
         "photo_stats": photo_dataset.stats,
@@ -666,12 +744,15 @@ def main():
     print(f"Projection      : {projection_info}")
     print(f"Layout          : {args.layout}")
     print(f"Normalize feat  : {args.normalize_features}")
+    print(f"Frechet overall : {frechet_report['overall']:.6f}")
     print(f"Photo samples   : {len(photo_dataset)}")
     print(f"Sketch samples  : {len(sketch_dataset)}")
     print(f"Saved photo     : {output_dir / 'photo_embedding.png'}")
     print(f"Saved sketch    : {output_dir / 'sketch_embedding.png'}")
     print(f"Saved CSV       : {output_dir / 'embedding_points.csv'}")
     print(f"Saved summary   : {output_dir / 'summary.json'}")
+    for classname, class_report in frechet_report["per_class"].items():
+        print(f"Frechet[{classname}] : {class_report['distance']:.6f}")
     if missing_keys:
         print(f"Missing keys    : {missing_keys}")
     if unexpected_keys:
