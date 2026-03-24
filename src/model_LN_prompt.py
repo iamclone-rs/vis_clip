@@ -30,7 +30,7 @@ class Model(pl.LightningModule):
         super().__init__()
 
         self.opts = opts
-        self.clip, _ = clip.load('ViT-B/32', device=self.device)
+        self.clip, _ = clip.load('ViT-B/32', device='cpu')
         self.clip.apply(freeze_all_but_bn)
         self.clip.train()
 
