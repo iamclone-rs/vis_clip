@@ -19,7 +19,8 @@ def freeze_all_but_bn(m):
 
 
 def category_to_id(category):
-    return int(hashlib.sha1(category.encode('utf-8')).hexdigest()[:16], 16)
+    digest = hashlib.sha1(category.encode('utf-8')).digest()
+    return int.from_bytes(digest[:8], byteorder='big', signed=False) % (2**63 - 1)
 
 
 def average_precision(scores, target):
@@ -147,8 +148,8 @@ class Model(pl.LightningModule):
             ap[idx] = average_precision(scores, target)
         
         mAP = torch.mean(ap)
-        self.log('val_loss', val_loss, prog_bar=False, logger=True)
-        self.log('mAP', mAP)
+        self.log('val_loss', val_loss, prog_bar=False, logger=True, sync_dist=True)
+        self.log('mAP', mAP, sync_dist=True)
         self.best_metric.copy_(torch.maximum(self.best_metric, mAP.detach().to(self.best_metric.device)))
         self.print(
             f'Epoch {self.current_epoch + 1}: '

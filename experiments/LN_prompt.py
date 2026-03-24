@@ -1,4 +1,5 @@
 import os
+import torch
 from torch.utils.data import DataLoader
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -18,7 +19,7 @@ class SaveBestAndLastCheckpoint(Callback):
         self.last_path = os.path.join(dirpath, 'last.ckpt')
 
     def on_validation_end(self, trainer, pl_module):
-        if trainer.sanity_checking:
+        if trainer.sanity_checking or not trainer.is_global_zero:
             return
 
         os.makedirs(self.dirpath, exist_ok=True)
@@ -37,8 +38,22 @@ if __name__ == '__main__':
     train_dataset = Sketchy(opts, dataset_transforms, mode='train', return_orig=False)
     val_dataset = Sketchy(opts, dataset_transforms, mode='val', used_cat=train_dataset.all_categories, return_orig=False)
 
-    train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size, num_workers=opts.workers)
-    val_loader = DataLoader(dataset=val_dataset, batch_size=opts.batch_size, num_workers=opts.workers)
+    worker_count = min(opts.workers, os.cpu_count() or opts.workers)
+    if worker_count != opts.workers:
+        print(f'capping dataloader workers from {opts.workers} to {worker_count}')
+
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=opts.batch_size,
+        num_workers=worker_count,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=worker_count > 0)
+    val_loader = DataLoader(
+        dataset=val_dataset,
+        batch_size=opts.batch_size,
+        num_workers=worker_count,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=worker_count > 0)
 
     logger = TensorBoardLogger('tb_logs', name=opts.exp_name)
     checkpoint_dir = os.path.join('saved_models', opts.exp_name)
@@ -51,10 +66,13 @@ if __name__ == '__main__':
     else:
         print ('resuming training from %s'%ckpt_path)
 
-    trainer = Trainer(gpus=-1,
+    trainer = Trainer(
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=-1 if torch.cuda.is_available() else 1,
         min_epochs=1, max_epochs=2000,
         benchmark=True,
         logger=logger,
+        enable_checkpointing=False,
         enable_progress_bar=False,
         check_val_every_n_epoch=1,
         callbacks=[checkpoint_callback]
